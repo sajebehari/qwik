@@ -15,12 +15,13 @@
 import { assertDefined, assertFalse, assertTrue } from '../../error/assert';
 import type { QRLInternal } from '../../qrl/qrl-class';
 import type { QRL } from '../../qrl/qrl.public';
-import { tryGetInvokeContext, type InvokeContext } from '../../use/use-core';
+import { newInvokeContext, tryGetInvokeContext } from '../../use/use-core';
 import { Task, isTask } from '../../use/use-task';
 import { isPromise } from '../../util/promises';
 import { qDev } from '../../util/qdev';
 import type { VNode } from '../client/types';
 import { ChoreType } from '../shared/scheduler';
+import type { Container2 } from '../shared/types';
 import type { Signal2 as ISignal2 } from './v2-signal.public';
 
 const DEBUG = true;
@@ -37,14 +38,12 @@ const NEEDS_COMPUTATION: any = {
 const log = (...args: any[]) => console.log(...args);
 
 export const createSignal2 = (value?: any) => {
+  // @wmertens: Question @mhevery: why null instead of not provided?
   return new Signal2(value, null);
 };
 
-// TODO(mhevery): this should not be a public API.
 export const createComputedSignal2 = <T>(qrl: QRL<() => T>) => {
-  const signal = new Signal2(NEEDS_COMPUTATION, qrl as QRLInternal<() => T>);
-  signal.untrackedValue; // trigger computation
-  return signal;
+  return new Signal2(NEEDS_COMPUTATION, qrl as QRLInternal<() => T>);
 };
 
 export const isSignal2 = (value: any): value is ISignal2<unknown> => {
@@ -69,7 +68,8 @@ class Signal2<T = any> implements ISignal2<T> {
    * processing a change in a signal, the leaves (`Task` and `VNode`) are scheduled for execution,
    * where as the Nodes (`Signal2`) are synchronously recursed into and marked as dirty.
    */
-  private $effects$: null | Array<Task | VNode | Signal2> = null;
+  // @wmertens: Question @mhevery: why null instead of not provided?
+  private $effects$: null | Set<Task | VNode | Signal2> = null;
 
   /**
    * If this signal is computed, then compute function is stored here.
@@ -79,44 +79,36 @@ class Signal2<T = any> implements ISignal2<T> {
    */
   private $computeQrl$: null | QRLInternal<() => T>;
 
-  /**
-   * The execution context when the signal was being created.
-   *
-   * The context contains the scheduler and the subscriber, and is used by the derived signal to
-   * capture dependencies.
-   */
-  private $context$: InvokeContext | undefined;
+  private $container2$: Container2 | undefined;
 
   constructor(value: T, computeTask: QRLInternal<() => T> | null) {
     this.$untrackedValue$ = value;
     this.$computeQrl$ = computeTask;
-    this.$context$ = tryGetInvokeContext();
   }
 
   get untrackedValue() {
     let untrackedValue = this.$untrackedValue$;
+    // TODO if we want computed signals to only trigger effects when actually changed, use a separate flag for dirty.
+    // we should probably also make a subclass
     if (untrackedValue === NEEDS_COMPUTATION) {
       assertDefined(
         this.$computeQrl$,
         'Signal is marked as dirty, but no compute function is provided.'
       );
       const computeQrl = this.$computeQrl$!;
-      const ctx = this.$context$;
-      const computedFn = computeQrl.getFn(ctx);
-      if (isPromise(computedFn)) {
-        throw computedFn;
-      } else {
-        const previousSubscriber = ctx?.$subscriber$;
-        try {
-          ctx && (ctx.$subscriber$ = this as any);
-          untrackedValue = (computedFn as () => T)();
-        } finally {
-          ctx && (ctx.$subscriber$ = previousSubscriber);
-        }
-        assertFalse(isPromise(untrackedValue), 'Computed function must be synchronous.');
-        DEBUG && log('Signal.computed', untrackedValue);
-        this.$untrackedValue$ = untrackedValue;
+      if (!computeQrl.resolved) {
+        // rewind the render and wait for the promise to resolve.
+        // Maybe we can let the optimizer hint required qrls
+        throw computeQrl.resolve();
       }
+      // TODO locale
+      const ctx = newInvokeContext();
+      ctx.$subscriber$ = this as any;
+      ctx.$container2$ = this.$container2$;
+      untrackedValue = computeQrl.getFn(ctx)() as T;
+      assertFalse(isPromise(untrackedValue), 'Computed function must be synchronous.');
+      DEBUG && log('Signal.computed', untrackedValue);
+      this.$untrackedValue$ = untrackedValue;
     }
     assertFalse(untrackedValue === NEEDS_COMPUTATION, 'Signal is not computed.');
     return untrackedValue;
@@ -124,28 +116,27 @@ class Signal2<T = any> implements ISignal2<T> {
 
   get value() {
     const ctx = tryGetInvokeContext();
-    const subscriber = ctx?.$subscriber$;
-    let target: Signal2 | Task;
-    if (subscriber) {
-      if (subscriber instanceof Signal2) {
-        assertDefined(subscriber.$computeQrl$, 'Expecting ComputedSignal');
-        // Special case of a computed signal.
-        subscriber.$untrackedValue$ = NEEDS_COMPUTATION;
-        const qrl = subscriber.$computeQrl$!;
-        if (!qrl.resolved) {
-          const resolved = subscriber.$computeQrl$.resolve();
-          this.$context$?.$container2$?.$scheduler$(ChoreType.QRL_RESOLVE, null, null, resolved);
-        }
-        target = subscriber;
-      } else {
-        target = subscriber[1] as Task;
-        assertTrue(isTask(target), 'Invalid subscriber.');
+    if (ctx) {
+      if (!this.$container2$) {
+        // Grab the container now we have access to it
+        this.$container2$ = ctx.$container2$;
       }
-      const effects = this.$effects$ || (this.$effects$ = []);
-      const existingIdx = effects.indexOf(target);
-      if (existingIdx === -1) {
-        DEBUG && log('Signal.subscribe', isSignal2(target) ? 'Signal2' : 'Task', String(target));
-        this.$effects$?.push(target);
+      const subscriber = ctx.$subscriber$;
+      if (subscriber) {
+        let target: Signal2 | Task;
+        if (subscriber instanceof Signal2) {
+          // computed signal reading a signal
+          assertDefined(subscriber.$computeQrl$, 'Expecting ComputedSignal');
+          target = subscriber;
+        } else {
+          target = subscriber[1] as Task;
+          assertTrue(isTask(target), 'Invalid subscriber.');
+        }
+        const effects = (this.$effects$ ||= new Set());
+        DEBUG &&
+          !effects.has(target) &&
+          log('Signal.subscribe', isSignal2(target) ? 'Signal2' : 'Task', String(target));
+        effects.add(target);
       }
     }
     return this.untrackedValue;
@@ -153,24 +144,54 @@ class Signal2<T = any> implements ISignal2<T> {
 
   set value(value) {
     if (value !== this.untrackedValue) {
-      DEBUG && log('Signal.set', this.untrackedValue, '->', value);
+      DEBUG &&
+        log(
+          'Signal.set',
+          this.untrackedValue,
+          '->',
+          value,
+          this.$effects$?.size,
+          !!this.$container2$
+        );
       this.$untrackedValue$ = value;
-      if (this.$effects$ && this.$context$) {
-        const scheduler = this.$context$.$container2$!.$scheduler$;
+      if (this.$effects$ && this.$container2$) {
+        const scheduler = this.$container2$.$scheduler$;
         const scheduleEffect = (effect: VNode | Task | Signal2) => {
           DEBUG && log('       schedule.effect', String(effect));
           if (isTask(effect)) {
             scheduler(ChoreType.TASK, effect);
           } else if (effect instanceof Signal2) {
+            // clear the computed signal and notify its subscribers
             effect.$untrackedValue$ = NEEDS_COMPUTATION;
             effect.$effects$?.forEach(scheduleEffect);
+            const qrl = effect.$computeQrl$!;
+            if (!qrl.resolved) {
+              const resolved = qrl.resolve();
+              scheduler(ChoreType.QRL_RESOLVE, null, null, resolved);
+            }
           } else {
             throw new Error('Not implemented');
           }
         };
+
+        // Note, effects may not add new effects while this runs
         this.$effects$.forEach(scheduleEffect);
+        this.$effects$.clear();
       }
     }
+  }
+
+  // prevent accidental use as value
+  valueOf() {
+    if (qDev) {
+      throw new TypeError('Cannot coerce a Signal, use `.value` instead');
+    }
+  }
+  toString() {
+    return `[Signal ${String(this.value)}]`;
+  }
+  toJSON() {
+    return { value: this.value };
   }
 }
 

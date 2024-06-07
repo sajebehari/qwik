@@ -52,12 +52,16 @@ describe('v2-signal', () => {
         const b = createSignal2(10);
         await retry(() => {
           const signal = createComputed2$(() => a.value + b.value);
-          expect((signal as any).$untrackedValue$).toEqual(12);
+          expect((signal as any).$untrackedValue$).not.toEqual(12);
+          // This won't register a subscriber because there isn't any,
+          // but it will update the value and store the container.
           expect(signal.value).toEqual(12);
+          expect((signal as any).$untrackedValue$).toEqual(12);
           effect$(() => log.push(signal.value));
           expect(log).toEqual([12]);
           a.value++;
           b.value += 10;
+          // effects must run async
           expect(log).toEqual([12]);
         });
         await flushSignals();

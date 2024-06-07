@@ -117,12 +117,11 @@ export const createQRL = <TYPE>(
       return (symbolRef = symbolFn().then(
         (module) => (qrl.resolved = symbolRef = module[symbol] as TYPE)
       ));
-    } else {
-      const symbol2 = getPlatform().importSymbol(_containerEl, chunk, symbol);
-      return (symbolRef = maybeThen(symbol2, (ref) => {
-        return (qrl.resolved = symbolRef = ref);
-      }));
     }
+    const symbol2 = getPlatform().importSymbol(_containerEl, chunk, symbol);
+    return (symbolRef = maybeThen(symbol2, (ref) => {
+      return (qrl.resolved = symbolRef = ref);
+    }));
   };
 
   const resolveLazy = (containerEl?: Element): ValueOrPromise<TYPE> => {
