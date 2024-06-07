@@ -38,12 +38,11 @@ const NEEDS_COMPUTATION: any = {
 const log = (...args: any[]) => console.log(...args);
 
 export const createSignal2 = (value?: any) => {
-  // @wmertens: Question @mhevery: why null instead of not provided?
-  return new Signal2(value, null);
+  return new Signal2(value);
 };
 
 export const createComputedSignal2 = <T>(qrl: QRL<() => T>) => {
-  return new Signal2(NEEDS_COMPUTATION, qrl as QRLInternal<() => T>);
+  return new ComputedSignal2(qrl as QRLInternal<() => T>);
 };
 
 export const isSignal2 = (value: any): value is ISignal2<unknown> => {
@@ -51,7 +50,7 @@ export const isSignal2 = (value: any): value is ISignal2<unknown> => {
 };
 
 class Signal2<T = any> implements ISignal2<T> {
-  private $untrackedValue$: T;
+  protected $untrackedValue$: T;
 
   /**
    * Store a list of effects which are dependent on this signal.
@@ -69,49 +68,16 @@ class Signal2<T = any> implements ISignal2<T> {
    * where as the Nodes (`Signal2`) are synchronously recursed into and marked as dirty.
    */
   // @wmertens: Question @mhevery: why null instead of not provided?
-  private $effects$: null | Set<Task | VNode | Signal2> = null;
+  protected $effects$: null | Set<Task | VNode | Signal2> = null;
 
-  /**
-   * If this signal is computed, then compute function is stored here.
-   *
-   * The computed functions must be executed synchronously (because of this we need to eagerly
-   * resolve the QRL during the mark dirty phase so that any call to it will be synchronous). )
-   */
-  private $computeQrl$: null | QRLInternal<() => T>;
+  protected $container2$: Container2 | undefined;
 
-  private $container2$: Container2 | undefined;
-
-  constructor(value: T, computeTask: QRLInternal<() => T> | null) {
+  constructor(value: T) {
     this.$untrackedValue$ = value;
-    this.$computeQrl$ = computeTask;
   }
 
   get untrackedValue() {
-    let untrackedValue = this.$untrackedValue$;
-    // TODO if we want computed signals to only trigger effects when actually changed, use a separate flag for dirty.
-    // we should probably also make a subclass
-    if (untrackedValue === NEEDS_COMPUTATION) {
-      assertDefined(
-        this.$computeQrl$,
-        'Signal is marked as dirty, but no compute function is provided.'
-      );
-      const computeQrl = this.$computeQrl$!;
-      if (!computeQrl.resolved) {
-        // rewind the render and wait for the promise to resolve.
-        // Maybe we can let the optimizer hint required qrls
-        throw computeQrl.resolve();
-      }
-      // TODO locale
-      const ctx = newInvokeContext();
-      ctx.$subscriber$ = this as any;
-      ctx.$container2$ = this.$container2$;
-      untrackedValue = computeQrl.getFn(ctx)() as T;
-      assertFalse(isPromise(untrackedValue), 'Computed function must be synchronous.');
-      DEBUG && log('Signal.computed', untrackedValue);
-      this.$untrackedValue$ = untrackedValue;
-    }
-    assertFalse(untrackedValue === NEEDS_COMPUTATION, 'Signal is not computed.');
-    return untrackedValue;
+    return this.$untrackedValue$;
   }
 
   get value() {
@@ -124,9 +90,8 @@ class Signal2<T = any> implements ISignal2<T> {
       const subscriber = ctx.$subscriber$;
       if (subscriber) {
         let target: Signal2 | Task;
-        if (subscriber instanceof Signal2) {
+        if (subscriber instanceof ComputedSignal2) {
           // computed signal reading a signal
-          assertDefined(subscriber.$computeQrl$, 'Expecting ComputedSignal');
           target = subscriber;
         } else {
           target = subscriber[1] as Task;
@@ -143,42 +108,20 @@ class Signal2<T = any> implements ISignal2<T> {
   }
 
   set value(value) {
-    if (value !== this.untrackedValue) {
-      DEBUG &&
-        log(
-          'Signal.set',
-          this.untrackedValue,
-          '->',
-          value,
-          this.$effects$?.size,
-          !!this.$container2$
-        );
-      this.$untrackedValue$ = value;
-      if (this.$effects$ && this.$container2$) {
-        const scheduler = this.$container2$.$scheduler$;
-        const scheduleEffect = (effect: VNode | Task | Signal2) => {
-          DEBUG && log('       schedule.effect', String(effect));
-          if (isTask(effect)) {
-            scheduler(ChoreType.TASK, effect);
-          } else if (effect instanceof Signal2) {
-            // clear the computed signal and notify its subscribers
-            effect.$untrackedValue$ = NEEDS_COMPUTATION;
-            effect.$effects$?.forEach(scheduleEffect);
-            const qrl = effect.$computeQrl$!;
-            if (!qrl.resolved) {
-              const resolved = qrl.resolve();
-              scheduler(ChoreType.QRL_RESOLVE, null, null, resolved);
-            }
-          } else {
-            throw new Error('Not implemented');
-          }
-        };
-
-        // Note, effects may not add new effects while this runs
-        this.$effects$.forEach(scheduleEffect);
-        this.$effects$.clear();
-      }
+    if (value === this.untrackedValue) {
+      return;
     }
+    DEBUG &&
+      log(
+        'Signal.set',
+        this.untrackedValue,
+        '->',
+        value,
+        this.$effects$?.size,
+        !!this.$container2$
+      );
+    this.$untrackedValue$ = value;
+    this.$triggerEffects$();
   }
 
   // prevent accidental use as value
@@ -193,9 +136,111 @@ class Signal2<T = any> implements ISignal2<T> {
   toJSON() {
     return { value: this.value };
   }
+
+  $triggerEffects$() {
+    if (!(this.$effects$ && this.$container2$)) {
+      return;
+    }
+    const scheduler = this.$container2$.$scheduler$;
+    const scheduleEffect = (effect: VNode | Task | Signal2) => {
+      DEBUG && log('       schedule.effect', String(effect));
+      if (isTask(effect)) {
+        scheduler(ChoreType.TASK, effect);
+      } else if (effect instanceof ComputedSignal2) {
+        // clear the computed signal and notify its subscribers
+        effect.$markDirty$();
+      } else {
+        throw new Error('Not implemented');
+      }
+    };
+
+    // Note, effects may not add new effects while this runs
+    this.$effects$.forEach(scheduleEffect);
+    this.$effects$.clear();
+  }
+}
+
+class ComputedSignal2<T> extends Signal2<T> {
+  /**
+   * The compute function is stored here.
+   *
+   * The computed functions must be executed synchronously (because of this we need to eagerly
+   * resolve the QRL during the mark dirty phase so that any call to it will be synchronous). )
+   */
+  $computeQrl$: QRLInternal<() => T>;
+  // We need a separate flag so we know when a computation changed
+  $isDirty$: boolean = true;
+
+  constructor(computeTask: QRLInternal<() => T> | null) {
+    assertDefined(computeTask, 'compute QRL must be provided');
+    super(NEEDS_COMPUTATION);
+    this.$computeQrl$ = computeTask;
+  }
+
+  /** Invalidate the current value */
+  $markDirty$() {
+    this.$isDirty$ = true;
+    this.$triggerEffects$();
+  }
+
+  /**
+   * Use this to force running subscribers, for example when the calculated value has mutated but
+   * remained the same object
+   */
+  force() {
+    this.$untrackedValue$ = NEEDS_COMPUTATION;
+    this.$markDirty$();
+  }
+
+  $triggerEffects$(): void {
+    if (this.$effects$?.size) {
+      const qrl = this.$computeQrl$;
+      if (!qrl.resolved) {
+        const resolvedP = qrl.resolve();
+        this.$container2$?.$scheduler$(ChoreType.QRL_RESOLVE, null, null, resolvedP);
+      }
+    }
+    super.$triggerEffects$();
+  }
+
+  get untrackedValue() {
+    if (this.$isDirty$) {
+      const computeQrl = this.$computeQrl$;
+      if (!computeQrl.resolved) {
+        // rewind the render and wait for the promise to resolve.
+        // Maybe we can let the optimizer hint required qrls
+        throw computeQrl.resolve();
+      }
+
+      // TODO locale (ideally move to global state)
+      const ctx = newInvokeContext();
+      ctx.$subscriber$ = this as any;
+      ctx.$container2$ = this.$container2$;
+      const untrackedValue = computeQrl.getFn(ctx)() as T;
+
+      assertFalse(isPromise(untrackedValue), 'Computed function must be synchronous.');
+      DEBUG && log('Signal.computed', untrackedValue);
+      this.$untrackedValue$ = untrackedValue;
+      this.$isDirty$ = false;
+    }
+    return this.$untrackedValue$;
+  }
+
+  // Getters don't get inherited
+  get value() {
+    return super.value;
+  }
+
+  set value(_: any) {
+    throw new TypeError('ComputedSignal is read-only');
+  }
 }
 
 qDev &&
   (Signal2.prototype.toString = () => {
     return 'Signal2';
+  });
+qDev &&
+  (ComputedSignal2.prototype.toString = () => {
+    return 'ComputedSignal2';
   });

@@ -46,7 +46,7 @@ describe('v2-signal', () => {
   });
 
   describe('computed', () => {
-    it.only('basic subscription operation', async () => {
+    it('basic subscription operation', async () => {
       await withScheduler(async () => {
         const a = createSignal2(2);
         const b = createSignal2(10);
@@ -68,6 +68,31 @@ describe('v2-signal', () => {
         expect(log).toEqual([12, 23]);
       });
     });
+    // using .only because otherwise there's a function-not-the-same issue
+    it.only('force', () =>
+      withScheduler(async () => {
+        const obj = { count: 0 };
+        const signal = createComputed2$(() => {
+          obj.count++;
+          return obj;
+        });
+        expect(signal.value).toBe(obj);
+        expect(obj.count).toBe(1);
+        effect$(() => log.push(signal.value.count));
+        await flushSignals();
+        expect(log).toEqual([1]);
+        expect(obj.count).toBe(1);
+        // mark dirty but value remains shallow same after calc
+        (signal as any).$isDirty$ = true;
+        signal.value.count;
+        await flushSignals();
+        expect(log).toEqual([1]);
+        expect(obj.count).toBe(2);
+        // force recalculation+notify
+        signal.force();
+        await flushSignals();
+        expect(log).toEqual([1, 3]);
+      }));
   });
   ////////////////////////////////////////
 
