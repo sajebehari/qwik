@@ -25,9 +25,9 @@ Slots allow a component to treat the JSX children of the component as a form of 
 
 This concept has different names in different frameworks:
 
-- In Angular is called Content Projection
+- In Angular, it's called Content Projection
 - In React, it's the `children` of the props
-- In Web components it's [`<slot>`](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/slot) as well
+- In Web components it's [`<slot>`](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/slot)
 
 The main API to achieve this is the `<Slot>` component, exported in `@builder.io/qwik`:
 <CodeSandbox src="/src/routes/demo/slot/basic/index.tsx" style={{ height: '6em' }}>
@@ -101,7 +101,7 @@ export default component$(() => {
 ```
 </CodeSandbox>
 
-Now, when consuming the `<Tab>` component, we can pass children and specify in which slot they should be placed, using the `q:slot` attribute:
+Now, when consuming the `<Tab>` component, you can pass children and specify in which slot they should be placed, using the `q:slot` attribute:
 
 Notice that:
 
